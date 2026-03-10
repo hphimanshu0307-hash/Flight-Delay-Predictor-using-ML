@@ -44,15 +44,22 @@ def fetch_weather_data_nws(lat, lon):
         return {"wind_speed": 10.0, "probability_of_precipitation": 0.0, "description": "Clear"}
 
 def map_api_to_features(flight_info, weather_info, encoder, train_cols):
-    dt_obj = datetime.fromisoformat(flight_info['departure']['scheduledTimeUtc'].replace('Z', '+00:00'))
+    # Robust timestamp extraction
+    departure = flight_info.get('departure', {})
+    sched_time = departure.get('scheduledTimeUtc') or departure.get('scheduledTimeLocal') or datetime.now().isoformat()
+    
+    dt_obj = datetime.fromisoformat(sched_time.replace('Z', '+00:00'))
     month, day_of_week = dt_obj.month, dt_obj.isoweekday()
     dep_time = int(dt_obj.strftime('%H%M'))
     season = 'Winter' if month in [12, 1, 2] else 'Spring' if month in [3, 4, 5] else 'Summer' if month in [6, 7, 8] else 'Fall'
+    
     raw_input = pd.DataFrame([{
         'Month': month, 'DayOfWeek': day_of_week, 'DepTime': dep_time,
-        'Carrier': flight_info['airline']['iata'], 'OriginAirport': flight_info['departure']['airport']['name'],
+        'Carrier': flight_info.get('airline', {}).get('iata', 'AA'), 
+        'OriginAirport': departure.get('airport', {}).get('name', 'JFK'),
         'Continent': 'North America'
     }])
+    
     encoded_input = encoder.transform(raw_input)
     features = {
         'Month': month, 'DayOfWeek': day_of_week, 'DepTime': dep_time,
@@ -81,10 +88,14 @@ if st.button("Run Analysis"):
     if not api_key:
         st.warning("Please enter an API key in the sidebar.")
     else:
-        with st.spinner("Analyzing..."):
+        with st.spinner("Analyzing... "):
             f_data = fetch_flight_data(flight_num, api_key)
             if f_data:
-                w_data = fetch_weather_data_nws(f_data['departure']['airport']['location']['lat'], f_data['departure']['airport']['location']['lon'])
+                dep_info = f_data.get('departure', {})
+                loc = dep_info.get('airport', {}).get('location', {})
+                lat, lon = loc.get('lat', 40.64), loc.get('lon', -73.77)
+                
+                w_data = fetch_weather_data_nws(lat, lon)
                 input_df = map_api_to_features(f_data, w_data, encoder, train_cols)
                 prob = model.predict_proba(input_df)[0][1]
                 status = "DELAYED" if prob > 0.5 else "ON TIME"
@@ -101,4 +112,4 @@ if st.button("Run Analysis"):
                 shap.plots.waterfall(shap.Explanation(values=sv, base_values=ev, data=input_df.iloc[0], feature_names=train_cols), show=False)
                 st.pyplot(plt.gcf())
             else:
-                st.error("Flight not found.")
+                st.error("Flight not found. Try a common number like AA500 or DL123.")
