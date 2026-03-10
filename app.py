@@ -6,30 +6,29 @@ from datetime import datetime
 import shap
 import matplotlib.pyplot as plt
 import lightgbm as lgb
+import pickle
 import os
 
 # --- Helper Functions ---
+def load_artifacts():
+    try:
+        model = pickle.load(open('model.pkl', 'rb'))
+        encoder = pickle.load(open('encoder.pkl', 'rb'))
+        cols = pickle.load(open('columns.pkl', 'rb'))
+        return model, encoder, cols
+    except Exception as e:
+        st.error(f"Error loading model files: {e}")
+        return None, None, None
+
 def fetch_flight_data(flight_number, api_key):
     url = f"https://aerodatabox.p.rapidapi.com/flights/number/{flight_number}"
     headers = {"X-RapidAPI-Key": api_key, "X-RapidAPI-Host": "aerodatabox.p.rapidapi.com"}
     try:
         response = requests.get(url, headers=headers)
         response.raise_for_status()
-        flight_info = response.json()[0]
-        return {
-            "departure": {
-                "airport": flight_info['departure']['airport']['name'],
-                "scheduled": flight_info['departure']['scheduledTimeUtc'],
-                "lat": flight_info['departure']['airport']['location']['lat'],
-                "lon": flight_info['departure']['airport']['location']['lon']
-            },
-            "airline": {"iata": flight_number[:2]}
-        }
+        return response.json()[0]
     except Exception:
-        return {
-            "departure": {"airport": "JFK", "scheduled": "2024-12-01T10:30:00+00:00", "lat": 40.6413, "lon": -73.7781},
-            "airline": {"iata": "AA"}
-        }
+        return None
 
 def fetch_weather_data_nws(lat, lon):
     try:
@@ -44,52 +43,62 @@ def fetch_weather_data_nws(lat, lon):
     except Exception:
         return {"wind_speed": 10.0, "probability_of_precipitation": 0.0, "description": "Clear"}
 
+def map_api_to_features(flight_info, weather_info, encoder, train_cols):
+    dt_obj = datetime.fromisoformat(flight_info['departure']['scheduledTimeUtc'].replace('Z', '+00:00'))
+    month, day_of_week = dt_obj.month, dt_obj.isoweekday()
+    dep_time = int(dt_obj.strftime('%H%M'))
+    season = 'Winter' if month in [12, 1, 2] else 'Spring' if month in [3, 4, 5] else 'Summer' if month in [6, 7, 8] else 'Fall'
+    raw_input = pd.DataFrame([{
+        'Month': month, 'DayOfWeek': day_of_week, 'DepTime': dep_time,
+        'Carrier': flight_info['airline']['iata'], 'OriginAirport': flight_info['departure']['airport']['name'],
+        'Continent': 'North America'
+    }])
+    encoded_input = encoder.transform(raw_input)
+    features = {
+        'Month': month, 'DayOfWeek': day_of_week, 'DepTime': dep_time,
+        'Carrier': encoded_input['Carrier'].iloc[0], 'OriginAirport': encoded_input['OriginAirport'].iloc[0],
+        'Precipitation': weather_info['probability_of_precipitation'] / 10.0, 'WindSpeed': weather_info['wind_speed'],
+        'Climate_Arctic Winds': 1 if season == 'Winter' else 0, 'Climate_Arid': 0, 'Climate_Monsoon': 0,
+        'Climate_Temperate': 1 if season in ['Spring', 'Fall'] else 0, 'Climate_Tropical Storm': 1 if season == 'Summer' else 0,
+        'Continent_Africa': 0, 'Continent_Asia': 0, 'Continent_Europe': 0, 'Continent_North America': 1,
+        'Continent_Oceania': 0, 'Continent_South America': 0
+    }
+    return pd.DataFrame([features])[train_cols]
+
 # --- Streamlit UI ---
 st.set_page_config(page_title="Global Flight Predictor", layout="wide")
 st.title("✈️ Global Flight Delay Predictor & Explainer")
 
-# Sidebar for Configuration
+model, encoder, train_cols = load_artifacts()
+
 with st.sidebar:
     st.header("Configuration")
-    api_key = st.text_input("AeroDataBox API Key", type="password", help="Enter your RapidAPI key")
+    api_key = st.text_input("AeroDataBox API Key", type="password")
 
-# Main Input Area
-col1, col2 = st.columns([2, 1])
-with col1:
-    flight_num = st.text_input("Flight Number", value="AA500", placeholder="e.g., AA500")
+flight_num = st.text_input("Flight Number", value="AA500")
 
-if st.button("Run Live Analysis"):
-    with st.spinner("Fetching live data and generating explanations..."):
-        # 1. Data Retrieval
-        f_data = fetch_flight_data(flight_num, api_key)
-        w_data = fetch_weather_data_nws(f_data['departure']['lat'], f_data['departure']['lon'])
-        
-        # 2. Mocking model/encoder for script completeness (In production, load these)
-        # Note: We use the variables from the notebook kernel if running locally, 
-        # but for app.py standalone, we assume final_model and encoder are defined.
-        
-        # 3. Display Metrics
-        # Logic: map_api_to_features would be called here to get input_df
-        # For demo purposes, we retrieve results from the global model state
-        prob = 0.4944 # Example prob from Variable #59
-        status = "ON TIME"
-        
-        m1, m2 = st.columns(2)
-        m1.metric("Delay Probability", f"{prob:.2%}")
-        m2.metric("Final Prediction", status)
-        
-        # 4. Expanders for Raw Data
-        with st.expander("View Raw Flight & Weather Details"):
-            st.write("**Flight Info:**", f_data)
-            st.write("**Weather Info:**", w_data)
-
-        # 5. SHAP Explainability
-        st.subheader("Why this prediction?")
-        # In app.py, we would compute shap_values for the input_df here
-        # Displaying a static placeholder for the plot logic:
-        fig, ax = plt.subplots(figsize=(10, 4))
-        # shap.plots.waterfall(explanation, show=False)
-        st.pyplot(plt.gcf())
-        st.write("The chart above breaks down how weather and carrier history influenced this specific forecast.")
-
-"
+if st.button("Run Analysis"):
+    if not api_key:
+        st.warning("Please enter an API key in the sidebar.")
+    else:
+        with st.spinner("Analyzing..."):
+            f_data = fetch_flight_data(flight_num, api_key)
+            if f_data:
+                w_data = fetch_weather_data_nws(f_data['departure']['airport']['location']['lat'], f_data['departure']['airport']['location']['lon'])
+                input_df = map_api_to_features(f_data, w_data, encoder, train_cols)
+                prob = model.predict_proba(input_df)[0][1]
+                status = "DELAYED" if prob > 0.5 else "ON TIME"
+                
+                st.metric("Delay Probability", f"{prob:.2%}")
+                st.write(f"**Status:** {status} | **Weather:** {w_data['description']}")
+                
+                explainer = shap.TreeExplainer(model)
+                shap_values = explainer.shap_values(input_df)
+                sv = shap_values[1][0] if isinstance(shap_values, list) else shap_values[0]
+                ev = explainer.expected_value[1] if isinstance(explainer.expected_value, (list, np.ndarray)) else explainer.expected_value
+                
+                fig, ax = plt.subplots(figsize=(10, 4))
+                shap.plots.waterfall(shap.Explanation(values=sv, base_values=ev, data=input_df.iloc[0], feature_names=train_cols), show=False)
+                st.pyplot(plt.gcf())
+            else:
+                st.error("Flight not found.")
