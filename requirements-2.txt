@@ -1,0 +1,8 @@
+streamlit
+pandas
+numpy
+requests
+lightgbm
+shap
+matplotlib
+category_encoders
